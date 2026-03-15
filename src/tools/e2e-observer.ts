@@ -11,20 +11,33 @@ import * as readline from 'readline';
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const CF_WORKERS = [
-  // Critical execution path
-  'orchestrator-worker',
-  'ai-parser-v2',
-  'prep-newtrade-worker',
-  'open-trade-forwarder',
-  'newtrade-worker',
-  'trade-maintainer',
-  'trade-manager-do',
-  'exchange-balance-do',
-  'telegram-router',
-  // Verification & Ground Truth
-  'bybit-verification-worker',
-  // Balance monitoring
-  'balance-worker',
+  // === SIGNAL PROCESSING ===
+  'orchestrator-worker',       // Hub/router — entry point
+  'ai-parser-v2',              // 6-pass Claude pipeline
+  'telegram-router',           // Notification routing
+
+  // === TRADE EXECUTION ===
+  'prep-newtrade-worker',      // Risk calc + position sizing
+  'open-trade-forwarder',      // Market order -> Bybit
+  'newtrade-worker',           // Bookkeeping + limit orders
+
+  // === TRADE MANAGEMENT (Executor) ===
+  'trade-maintainer',          // SL/TP/DCA/Partial TP changes
+  'trade-manager-do',          // Trade state (Durable Object)
+  'exchange-balance-do',       // Balance cache (Durable Object)
+
+  // === GROUND TRUTH VERIFICATION ===
+  'bybit-verification-worker', // Queries Bybit demo directly
+                               // Ground truth for ALL execution:
+                               // - Initial order filled?
+                               // - SL moved correctly?
+                               // - Partial TP executed?
+                               // - DCA triggered?
+                               // Verifies BOTH open-trade-forwarder
+                               // AND trade-maintainer outcomes
+
+  // === BALANCE & MONITORING ===
+  'balance-worker',            // Balance state every 5min
 ];
 
 const VM_PROCESSES = [
@@ -479,7 +492,15 @@ async function getLogSummary(args: { session_id: string; filter?: string }): Pro
     );
   } else if (filter === 'trade_flow') {
     lines = lines.filter(l =>
-      /trade|order|position|signal|parse|pipeline|newtrade|orchestrat|bybit/i.test(l)
+      /\[ORCHESTRATOR-WORKER\]|\[AI-PARSER\]|\[PREP-NEWTRADE\]|\[OPEN-TRADE-FORWARDER\]|\[NEWTRADE-WORKER\]|\[TRADE-MAINTAINER\]|\[BYBIT-VERIFICATION-WORKER\]|\[TRADE-MANAGER-DO\]|\[EXCHANGE-BALANCE-DO\]/i.test(l)
+    );
+  } else if (filter === 'execution_vs_verify') {
+    // Executor vs Ground Truth — shows mismatches immediately
+    // OPEN-TRADE-FORWARDER = initial execution
+    // TRADE-MAINTAINER     = ongoing management (SL/TP/DCA)
+    // BYBIT-VERIFICATION-WORKER = what actually happened on Bybit
+    lines = lines.filter(l =>
+      /\[OPEN-TRADE-FORWARDER\]|\[TRADE-MAINTAINER\]|\[BYBIT-VERIFICATION-WORKER\]/i.test(l)
     );
   }
   // 'all' = no filter
