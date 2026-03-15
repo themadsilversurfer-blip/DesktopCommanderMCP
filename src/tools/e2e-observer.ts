@@ -61,6 +61,8 @@ const ORCHESTRATOR_URL = process.env.ORCHESTRATOR_URL
   || 'https://orchestrator-worker.<your-subdomain>.workers.dev/process';
 const SIGNAL_BROADCASTER_URL = process.env.SIGNAL_BROADCASTER_URL
   || '';
+const VERIFICATION_WORKER_URL = process.env.VERIFICATION_WORKER_URL
+  || 'https://bybit-verification-worker.<your-subdomain>.workers.dev';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -674,9 +676,14 @@ async function getLogSummary(args: { session_id: string; filter?: string; last_n
 
   // Apply filter FIRST
   if (filter === 'errors_only') {
-    lines = lines.filter(l =>
-      /error|fail|exception|reject|timeout|SPAWN-ERROR/i.test(l)
-    );
+    lines = lines.filter(l => {
+      // Match real error indicators, not JSON keys like "exceptions": []
+      if (/SPAWN-ERROR/i.test(l)) return true;
+      if (/"exceptions":\s*\[\]/.test(l)) return false;  // Skip empty exception arrays
+      if (/"level":\s*"error"/.test(l)) return true;     // Wrangler tail error-level logs
+      return /\bERROR\b|\bFAILED\b|\bfailed\b|\breject(?:ed)?\b|\btimeout\b/i.test(l)
+        && !/^\s*"[^"]*":\s*\[?\]?/.test(l.replace(/^\[.*?\]\s*\[.*?\]\s*/, ''));  // Skip JSON key-only lines
+    });
   } else if (filter === 'trade_flow') {
     lines = lines.filter(l =>
       /\[ORCHESTRATOR-WORKER\]|\[AI-PARSER\]|\[PREP-NEWTRADE\]|\[OPEN-TRADE-FORWARDER\]|\[NEWTRADE-WORKER\]|\[TRADE-MAINTAINER\]|\[BYBIT-VERIFICATION-WORKER\]|\[TRADE-MANAGER-DO\]|\[EXCHANGE-BALANCE-DO\]/i.test(l)
@@ -898,6 +905,398 @@ async function triggerTestSignal(args: {
   }
 }
 
+// ── Mode 7: verify_trade ───────────────────────────────────────────────────
+
+async function verifyTrade(args: { do_key?: string }): Promise<ServerResult> {
+  if (VERIFICATION_WORKER_URL.includes('<your-subdomain>')) {
+    return {
+      content: [{
+        type: 'text',
+        text: `Error: VERIFICATION_WORKER_URL not configured.\n` +
+          `Set the VERIFICATION_WORKER_URL environment variable.\n` +
+          `Example: https://bybit-verification-worker.nio-thomas.workers.dev`,
+      }],
+      isError: true,
+    };
+  }
+
+  try {
+    const endpoint = args.do_key
+      ? `${VERIFICATION_WORKER_URL}/verify/${args.do_key}`
+      : `${VERIFICATION_WORKER_URL}/verify`;
+
+    const response = await fetch(endpoint);
+    if (!response.ok) {
+      return {
+        content: [{ type: 'text', text: `Verification worker error: ${response.status} ${response.statusText}` }],
+        isError: true,
+      };
+    }
+
+    const data = await response.json() as any;
+
+    // Format positions
+    let report = '';
+    if (data.summary) {
+      report += `Bybit Verification Report\n`;
+      report += `Status: ${data.summary.overallStatus}\n`;
+      report += `Positions: ${data.summary.totalBybitPositions} | Orders: ${data.summary.totalBybitOrders} | Active Trades (D1): ${data.summary.totalActiveTrades} | Discrepancies: ${data.summary.totalDiscrepancies}\n\n`;
+    }
+
+    // Format comparison table
+    const comparisons = data.comparison ? (Array.isArray(data.comparison) ? data.comparison : [data.comparison]) : [];
+    if (comparisons.length > 0) {
+      report += `Positions:\n`;
+      for (const comp of comparisons) {
+        const bybit = comp.bybit || {};
+        const pos = bybit.hasPosition
+          ? `${comp.symbol} ${comp.direction} | size=${bybit.positionSize} | avg=${bybit.avgPrice} | mark=${bybit.markPrice} | pnl=${bybit.unrealisedPnl} | SL=${bybit.stopLoss || 'NONE'} | TP=${bybit.takeProfit || 'NONE'} | lev=${bybit.leverage}`
+          : `${comp.symbol} ${comp.direction} | NO POSITION ON BYBIT`;
+        const d1 = comp.d1?.exists
+          ? `D1: status=${comp.d1.status} SL=${comp.d1.stopLoss} entries=${comp.d1.entryCount}`
+          : `D1: not found`;
+        const doState = comp.doState?.exists
+          ? `DO: status=${comp.doState.status} SL=${comp.doState.currentSL}`
+          : `DO: not found`;
+        report += `  ${pos}\n    ${d1} | ${doState}\n`;
+        if (bybit.activeOrders?.length > 0) {
+          report += `    Orders: ${bybit.activeOrders.map((o: any) => `${o.type} ${o.side} ${o.qty}@${o.price || o.triggerPrice || '?'} [${o.status}]`).join(', ')}\n`;
+        }
+      }
+      report += '\n';
+    }
+
+    // Format discrepancies
+    const discrepancies = data.discrepancies || [];
+    if (discrepancies.length > 0) {
+      report += `Discrepancies:\n`;
+      for (const d of discrepancies) {
+        report += `  [${d.severity}] ${d.doKey}: ${d.code} — ${d.detail}\n`;
+      }
+    } else {
+      report += `No discrepancies found.\n`;
+    }
+
+    return { content: [{ type: 'text', text: sanitizeOutput(report) }] };
+  } catch (err) {
+    return {
+      content: [{ type: 'text', text: `Error calling verification worker: ${err instanceof Error ? err.message : String(err)}` }],
+      isError: true,
+    };
+  }
+}
+
+// ── Mode 8: run_e2e_test ───────────────────────────────────────────────────
+
+async function runE2ETest(args: {
+  signal_payload: string;
+  session_name?: string;
+  poll_interval_seconds?: number;
+  max_wait_seconds?: number;
+  vm_host?: string;
+  vm_user?: string;
+}): Promise<ServerResult> {
+  const pollInterval = (args.poll_interval_seconds || 5) * 1000;
+  const maxWait = (args.max_wait_seconds || 60) * 1000;
+  const testStart = Date.now();
+
+  // Parse the signal payload
+  let signalPayload: any;
+  try {
+    signalPayload = JSON.parse(args.signal_payload);
+  } catch {
+    return {
+      content: [{ type: 'text', text: 'Error: signal_payload must be valid JSON in Baileys WhatsApp format.' }],
+      isError: true,
+    };
+  }
+
+  // Ensure messageId exists
+  if (!signalPayload.messageId) {
+    signalPayload.messageId = `e2e-${Date.now()}`;
+  }
+  const messageId = signalPayload.messageId;
+
+  // Check URLs configured
+  if (ORCHESTRATOR_URL.includes('<your-subdomain>')) {
+    return {
+      content: [{ type: 'text', text: 'Error: ORCHESTRATOR_URL not configured. Set env var.' }],
+      isError: true,
+    };
+  }
+  if (VERIFICATION_WORKER_URL.includes('<your-subdomain>')) {
+    return {
+      content: [{ type: 'text', text: 'Error: VERIFICATION_WORKER_URL not configured. Set env var.' }],
+      isError: true,
+    };
+  }
+
+  const report: string[] = [];
+  const status: Record<string, string> = {};
+
+  report.push(`E2E Test Run — ${messageId}`);
+  report.push(`Signal: ${signalPayload.data?.body?.substring(0, 80) || 'unknown'}...`);
+  report.push('');
+
+  // ── Step 1: Pre-check Bybit ──
+  let prePositionCount = 0;
+  try {
+    const preRes = await fetch(`${VERIFICATION_WORKER_URL}/bybit/positions`);
+    if (preRes.ok) {
+      const preData = await preRes.json() as any;
+      prePositionCount = preData.count || 0;
+      report.push(`[PRE-CHECK] Bybit positions before: ${prePositionCount}`);
+    }
+  } catch (err) {
+    report.push(`[PRE-CHECK] Warning: could not reach verification worker: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // ── Step 2: Start observation ──
+  let sessionId: string | undefined;
+  const sessionName = args.session_name || `e2e_test_${Date.now()}`;
+  try {
+    const obsResult = await startObservation({
+      mode: 'start_observation',
+      session_name: sessionName,
+      signal_source: 'run_e2e_test',
+      duration_seconds: Math.max(120, Math.ceil(maxWait / 1000) + 30),
+      vm_host: args.vm_host,
+      vm_user: args.vm_user,
+    });
+    const obsText = obsResult.content?.[0] && 'text' in obsResult.content[0] ? obsResult.content[0].text : '';
+    const sessionMatch = obsText.match(/Session:\s*(e2e_\w+)/);
+    sessionId = sessionMatch?.[1];
+    if (obsResult.isError) {
+      report.push(`[OBSERVATION] FAILED: ${obsText}`);
+      return { content: [{ type: 'text', text: report.join('\n') }], isError: true };
+    }
+    report.push(`[OBSERVATION] Started session ${sessionId}`);
+    status['observation'] = 'OK';
+  } catch (err) {
+    report.push(`[OBSERVATION] Failed to start: ${err instanceof Error ? err.message : String(err)}`);
+    return { content: [{ type: 'text', text: report.join('\n') }], isError: true };
+  }
+
+  // Small delay to let wrangler tails connect
+  await new Promise(r => setTimeout(r, 3000));
+
+  // ── Step 3: Send trade signal ──
+  let orchestratorResponse: any;
+  try {
+    report.push(`[SIGNAL] Sending to orchestrator...`);
+    const signalStart = Date.now();
+    const res = await fetch(ORCHESTRATOR_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signalPayload),
+    });
+    const resText = await res.text();
+    try {
+      orchestratorResponse = JSON.parse(resText);
+    } catch {
+      orchestratorResponse = { raw: resText };
+    }
+    const signalTime = Date.now() - signalStart;
+
+    if (orchestratorResponse.success) {
+      status['orchestrator'] = 'OK';
+      // Parse AI parser result
+      const ai = orchestratorResponse.results?.ai;
+      if (ai?.success) {
+        status['ai_parser'] = `OK — ${ai.result?.message_type} ${ai.result?.symbol} ${ai.result?.side} (${ai.result?.confidence})`;
+        report.push(`[AI PARSER] ${ai.result?.message_type} | ${ai.result?.symbol} ${ai.result?.side} | confidence: ${ai.result?.confidence} | time: ${ai.processingTime}ms`);
+      } else {
+        status['ai_parser'] = `FAILED`;
+        report.push(`[AI PARSER] FAILED`);
+      }
+
+      // Parse telegram result
+      const tg = orchestratorResponse.results?.telegram;
+      if (tg?.success) {
+        status['telegram'] = `OK — ${tg.channelsSent} channel(s)`;
+        report.push(`[TELEGRAM] Sent to ${tg.channelsSent} channel(s) | time: ${tg.processingTime}ms`);
+      } else {
+        status['telegram'] = tg?.skipped ? 'SKIPPED' : 'FAILED';
+        report.push(`[TELEGRAM] ${tg?.skipped ? 'Skipped' : 'Failed'}`);
+      }
+
+      // Parse trade execution result
+      const d1 = orchestratorResponse.results?.d1Check;
+      if (d1?.newTradeTriggered) {
+        if (d1.newTradeSuccess) {
+          status['trade_execution'] = 'OK';
+          const exec = d1.newTradeResult?.executeResult;
+          report.push(`[TRADE EXEC] ${exec?.authoritativeStatus || 'unknown'} | boundary: ${exec?.executionBoundary} | time: ${d1.responseTime}ms`);
+          if (exec?.next?.statusUrl) {
+            report.push(`[TRADE EXEC] Status URL: ${exec.next.statusUrl}`);
+          }
+        } else {
+          status['trade_execution'] = 'FAILED';
+          report.push(`[TRADE EXEC] FAILED: ${d1.newTradeResult?.error || 'unknown'}`);
+        }
+      } else {
+        status['trade_execution'] = 'NOT TRIGGERED';
+        report.push(`[TRADE EXEC] Not triggered (message type may not require trade)`);
+      }
+
+      report.push(`[SIGNAL] Total orchestrator time: ${signalTime}ms`);
+    } else {
+      status['orchestrator'] = `FAILED — ${orchestratorResponse.error}`;
+      report.push(`[SIGNAL] FAILED: ${orchestratorResponse.error} (${signalTime}ms)`);
+    }
+  } catch (err) {
+    status['orchestrator'] = 'ERROR';
+    report.push(`[SIGNAL] Error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // ── Step 4: Poll Bybit verification ──
+  if (status['trade_execution'] === 'OK') {
+    report.push('');
+    report.push(`[VERIFY] Polling Bybit (every ${pollInterval / 1000}s, max ${maxWait / 1000}s)...`);
+
+    const pollStart = Date.now();
+    let positionFound = false;
+    let tpSet = false;
+    let slSet = false;
+    let finalVerification: any = null;
+    let pollCount = 0;
+
+    while (Date.now() - pollStart < maxWait) {
+      pollCount++;
+      await new Promise(r => setTimeout(r, pollInterval));
+
+      try {
+        // Check positions
+        const posRes = await fetch(`${VERIFICATION_WORKER_URL}/bybit/positions`);
+        if (posRes.ok) {
+          const posData = await posRes.json() as any;
+          const newPositions = (posData.positions || []).filter((p: any) => parseFloat(p.size) > 0);
+
+          // Check if a new position appeared (count increased)
+          if (newPositions.length > prePositionCount) {
+            positionFound = true;
+            // Now do full verification
+            const verifyRes = await fetch(`${VERIFICATION_WORKER_URL}/verify`);
+            if (verifyRes.ok) {
+              finalVerification = await verifyRes.json() as any;
+
+              // Check TP/SL on the new position
+              for (const comp of (finalVerification.comparison || [])) {
+                if (comp.bybit?.hasPosition && comp.d1?.messageId === messageId) {
+                  tpSet = (comp.bybit.takeProfit || 0) > 0;
+                  slSet = (comp.bybit.stopLoss || 0) > 0;
+                  break;
+                }
+              }
+
+              // Also check via direct position data
+              for (const pos of newPositions) {
+                if (parseFloat(pos.stopLoss || '0') > 0) slSet = true;
+                if (parseFloat(pos.takeProfit || '0') > 0) tpSet = true;
+              }
+            }
+          }
+        }
+
+        // Stop early if we found everything
+        if (positionFound && (tpSet || slSet)) {
+          report.push(`[VERIFY] Position confirmed + TP/SL detected after ${pollCount} polls (${((Date.now() - pollStart) / 1000).toFixed(1)}s)`);
+          break;
+        }
+
+        if (positionFound && !tpSet && !slSet) {
+          // Position found but no TP/SL yet — keep polling for TP/SL
+          if (pollCount === 1 || pollCount % 3 === 0) {
+            report.push(`[VERIFY] Position found, waiting for TP/SL... (poll #${pollCount})`);
+          }
+        }
+      } catch {
+        // Retry on network error
+      }
+    }
+
+    if (!positionFound) {
+      status['bybit_position'] = 'NOT FOUND (timeout)';
+      report.push(`[VERIFY] Position NOT found on Bybit after ${maxWait / 1000}s`);
+    } else {
+      status['bybit_position'] = 'CONFIRMED';
+      report.push(`[VERIFY] Position confirmed on Bybit`);
+    }
+
+    status['bybit_tp'] = tpSet ? 'SET' : 'NOT SET';
+    status['bybit_sl'] = slSet ? 'SET' : 'NOT SET';
+    if (!tpSet) report.push(`[VERIFY] TP: NOT set on Bybit`);
+    if (!slSet) report.push(`[VERIFY] SL: NOT set on Bybit`);
+
+    // Report discrepancies from final verification
+    if (finalVerification?.discrepancies?.length > 0) {
+      report.push('');
+      report.push(`[DISCREPANCIES] ${finalVerification.discrepancies.length} found:`);
+      for (const d of finalVerification.discrepancies) {
+        report.push(`  [${d.severity}] ${d.doKey}: ${d.code} — ${d.detail}`);
+      }
+    }
+  }
+
+  // ── Step 5: Check error logs ──
+  if (sessionId) {
+    try {
+      const errResult = await getLogSummary({
+        session_id: sessionId,
+        filter: 'errors_only',
+        last_n_lines: 50,
+      });
+      const errText = errResult.content?.[0] && 'text' in errResult.content[0] ? errResult.content[0].text : '';
+      const filterMatch = errText.match(/After filter:\s*(\d+)/);
+      const errorLineCount = filterMatch ? parseInt(filterMatch[1]) : 0;
+      if (errorLineCount > 0) {
+        report.push('');
+        report.push(`[ERRORS] ${errorLineCount} error lines in logs`);
+        // Include first few error lines
+        const lines = errText.split('\n');
+        const logLines = lines.filter(l => l.startsWith('[2'));
+        for (const line of logLines.slice(0, 10)) {
+          report.push(`  ${line.substring(0, 200)}`);
+        }
+        if (logLines.length > 10) report.push(`  ... and ${logLines.length - 10} more`);
+      } else {
+        report.push(`[ERRORS] No errors in logs`);
+      }
+    } catch {
+      report.push(`[ERRORS] Could not read error logs`);
+    }
+  }
+
+  // ── Step 6: Stop observation ──
+  if (sessionId) {
+    try {
+      await stopSessionInternal(sessionId, 'e2e_test_complete');
+      report.push(`[OBSERVATION] Stopped session ${sessionId}`);
+    } catch {
+      // Already stopped by auto-timer
+    }
+  }
+
+  // ── Final Summary ──
+  const totalTime = ((Date.now() - testStart) / 1000).toFixed(1);
+  report.push('');
+  report.push(`══════════════════════════════════════`);
+  report.push(`E2E Test Summary (${totalTime}s)`);
+  report.push(`══════════════════════════════════════`);
+  for (const [key, val] of Object.entries(status)) {
+    const icon = val.startsWith('OK') || val === 'CONFIRMED' || val === 'SET' ? 'PASS' : val.includes('SKIP') ? 'SKIP' : 'FAIL';
+    report.push(`  [${icon}] ${key}: ${val}`);
+  }
+
+  const hasFail = Object.values(status).some(v => !v.startsWith('OK') && v !== 'CONFIRMED' && v !== 'SET' && !v.includes('SKIP') && v !== 'NOT TRIGGERED');
+  report.push(`  Overall: ${hasFail ? 'ISSUES FOUND' : 'ALL CLEAR'}`);
+
+  return {
+    content: [{ type: 'text', text: sanitizeOutput(report.join('\n')) }],
+    isError: hasFail ? true : undefined,
+  };
+}
+
 // ── Main Export ─────────────────────────────────────────────────────────────
 
 export async function e2eObserver(args: unknown): Promise<ServerResult> {
@@ -929,6 +1328,17 @@ export async function e2eObserver(args: unknown): Promise<ServerResult> {
       return triggerTestSignal({
         trigger_method: parsed.data.trigger_method!,
         signal_payload: parsed.data.signal_payload,
+      });
+    case 'verify_trade':
+      return verifyTrade({ do_key: parsed.data.do_key });
+    case 'run_e2e_test':
+      return runE2ETest({
+        signal_payload: parsed.data.signal_payload!,
+        session_name: parsed.data.session_name,
+        poll_interval_seconds: parsed.data.poll_interval_seconds,
+        max_wait_seconds: parsed.data.max_wait_seconds,
+        vm_host: parsed.data.vm_host,
+        vm_user: parsed.data.vm_user,
       });
     default:
       return {

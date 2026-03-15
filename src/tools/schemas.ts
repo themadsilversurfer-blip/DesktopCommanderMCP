@@ -219,7 +219,7 @@ export const TrackUiEventArgsSchema = z.object({
 
 // E2E Observer schema
 export const E2EObserverArgsSchema = z.object({
-  mode: z.enum(['preflight_check', 'start_observation', 'stop_observation', 'get_log_summary', 'list_sessions', 'trigger_test_signal']),
+  mode: z.enum(['preflight_check', 'start_observation', 'stop_observation', 'get_log_summary', 'list_sessions', 'trigger_test_signal', 'verify_trade', 'run_e2e_test']),
   // start_observation params
   session_name: z.string().optional(),
   signal_source: z.string().optional(),
@@ -234,6 +234,11 @@ export const E2EObserverArgsSchema = z.object({
   // trigger_test_signal params
   trigger_method: z.enum(['signal_broadcaster', 'direct_post']).optional(),
   signal_payload: z.string().optional(),
+  // verify_trade params
+  do_key: z.string().optional(),
+  // run_e2e_test params
+  poll_interval_seconds: z.number().optional(),
+  max_wait_seconds: z.number().optional(),
 }).superRefine((data, ctx) => {
   if (data.mode === 'stop_observation' && !data.session_id) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'session_id is required for stop_observation', path: ['session_id'] });
@@ -243,5 +248,8 @@ export const E2EObserverArgsSchema = z.object({
   }
   if (data.mode === 'trigger_test_signal' && !data.trigger_method) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'trigger_method is required for trigger_test_signal', path: ['trigger_method'] });
+  }
+  if (data.mode === 'run_e2e_test' && !data.signal_payload) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'signal_payload (JSON string) is required for run_e2e_test', path: ['signal_payload'] });
   }
 });
