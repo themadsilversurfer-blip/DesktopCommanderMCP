@@ -11,6 +11,7 @@ import * as readline from 'readline';
 // ── Constants ──────────────────────────────────────────────────────────────
 
 const CF_WORKERS = [
+  // Critical execution path
   'orchestrator-worker',
   'ai-parser-v2',
   'prep-newtrade-worker',
@@ -20,6 +21,10 @@ const CF_WORKERS = [
   'trade-manager-do',
   'exchange-balance-do',
   'telegram-router',
+  // Verification & Ground Truth
+  'bybit-verification-worker',
+  // Balance monitoring
+  'balance-worker',
 ];
 
 const VM_PROCESSES = [
@@ -238,14 +243,22 @@ async function startObservation(args: {
     wranglerAuthenticated = false;
   }
 
-  let wranglerWarning = '';
   if (!wranglerAuthenticated) {
-    wranglerWarning = `Wrangler not authenticated. Run 'wrangler login' first. Starting with VM processes only.`;
-    writeStream.write(`[${formatTimestamp()}] [OBSERVER] Wrangler auth check FAILED - skipping CF Worker tailing\n`);
+    writeStream.write(`[${formatTimestamp()}] [OBSERVER] Wrangler auth check FAILED - BLOCKING start\n`);
+    writeStream.end();
+    return {
+      content: [{
+        type: 'text',
+        text: `Error: Wrangler not authenticated.\n\n` +
+          `E2E observation requires ALL components — partial observation is not acceptable.\n` +
+          `Run 'npx wrangler login' in your terminal first, then retry start_observation.\n\n` +
+          `Command: npx wrangler login`,
+      }],
+      isError: true,
+    };
   }
 
-  // Spawn wrangler tail for each CF Worker (only if authenticated)
-  if (wranglerAuthenticated) {
+  // Spawn wrangler tail for each CF Worker
   for (const workerName of CF_WORKERS) {
     try {
       const wranglerProc = spawn('npx', [
@@ -274,7 +287,6 @@ async function startObservation(args: {
       writeStream.write(`[${formatTimestamp()}] [${workerName.toUpperCase()}] SPAWN-ERROR: ${err instanceof Error ? err.message : String(err)}\n`);
     }
   }
-  } // end if (wranglerAuthenticated)
 
   // Set up auto-stop timer
   const autoStopTimer = setTimeout(async () => {
@@ -318,10 +330,6 @@ async function startObservation(args: {
     ? `SSH: connected (${VM_PROCESSES.length} VM processes)`
     : `SSH: FAILED - ${sshCheck.error}\nTip: Ensure SSH key is at ~/.ssh/id_rsa and host ${vmHost} is reachable`;
 
-  const wranglerStatus = wranglerAuthenticated
-    ? `Workers: ${CF_WORKERS.length} CF Workers tailing`
-    : `Workers: SKIPPED (not authenticated)`;
-
   const pidList = processes.map(p => `  ${p.name} (${p.type}): PID ${p.pid}`).join('\n');
 
   return {
@@ -334,8 +342,7 @@ async function startObservation(args: {
         `Duration: ${durationSeconds}s (auto-stop)\n` +
         `Log: ${logFile}\n` +
         `${sshStatus}\n` +
-        `${wranglerStatus}\n` +
-        (wranglerWarning ? `${wranglerWarning}\n` : '') +
+        `Workers: ${CF_WORKERS.length} CF Workers tailing\n` +
         `Total processes: ${processes.length}\n\n` +
         `PIDs:\n${pidList}`,
     }],
