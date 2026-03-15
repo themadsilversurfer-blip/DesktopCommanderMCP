@@ -41,8 +41,16 @@ const CF_WORKERS = [
 ];
 
 const VM_PROCESSES = [
-  { name: 'baileys-bridge', pm2Name: 'baileys-bridge' },
-  { name: 'belovy-price-monitor', pm2Name: 'belovy-price-monitor' },
+  {
+    name: 'baileys-bridge',
+    pm2Name: 'baileys-bridge',
+    logFiles: ['/root/.pm2/logs/baileys-bridge-out.log', '/root/.pm2/logs/baileys-bridge-error.log'],
+  },
+  {
+    name: 'belovy-price-monitor',
+    pm2Name: 'belovy-price-monitor',
+    logFiles: ['/root/.pm2/logs/belovy-price-monitor-out.log', '/root/.pm2/logs/belovy-price-monitor-error.log'],
+  },
 ];
 
 const DEFAULT_VM_HOST = '91.99.222.13';
@@ -402,7 +410,7 @@ async function startObservation(args: {
           '-o', 'ConnectTimeout=5',
           '-o', 'BatchMode=yes',
           `${vmUser}@${vmHost}`,
-          `pm2 logs ${vmProc.pm2Name} --lines 0 --raw --nostream=false`,
+          `tail -n 0 -f ${vmProc.logFiles.join(' ')}`,
         ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
         attachLineRouter(sshProc, vmProc.name, writeStream);
@@ -628,17 +636,16 @@ async function stopObservation(args: { session_id: string }): Promise<ServerResu
 
 // ── Mode 3: get_log_summary ────────────────────────────────────────────────
 
-async function getLogSummary(args: { session_id: string; filter?: string }): Promise<ServerResult> {
-  const { session_id, filter = 'all' } = args;
+async function getLogSummary(args: { session_id: string; filter?: string; last_n_lines?: number }): Promise<ServerResult> {
+  const { session_id, filter = 'all', last_n_lines = 200 } = args;
 
-  // Find log file - check active sessions first, then metadata files
+  // Find log file — check active sessions first, then metadata files
   let logFile: string | null = null;
 
   const activeSession = activeSessions.get(session_id);
   if (activeSession) {
     logFile = activeSession.logFile;
   } else {
-    // Check metadata files
     const metaFile = path.join(LOG_DIR, `${session_id}.meta.json`);
     try {
       const meta: SessionMeta = JSON.parse(await fsp.readFile(metaFile, 'utf-8'));
@@ -662,9 +669,10 @@ async function getLogSummary(args: { session_id: string; filter?: string }): Pro
     };
   }
 
-  let lines = content.split('\n');
+  let lines = content.split('\n').filter(l => l.length > 0);
+  const totalRaw = lines.length;
 
-  // Apply filter FIRST (before cap)
+  // Apply filter FIRST
   if (filter === 'errors_only') {
     lines = lines.filter(l =>
       /error|fail|exception|reject|timeout|SPAWN-ERROR/i.test(l)
@@ -674,29 +682,27 @@ async function getLogSummary(args: { session_id: string; filter?: string }): Pro
       /\[ORCHESTRATOR-WORKER\]|\[AI-PARSER\]|\[PREP-NEWTRADE\]|\[OPEN-TRADE-FORWARDER\]|\[NEWTRADE-WORKER\]|\[TRADE-MAINTAINER\]|\[BYBIT-VERIFICATION-WORKER\]|\[TRADE-MANAGER-DO\]|\[EXCHANGE-BALANCE-DO\]/i.test(l)
     );
   } else if (filter === 'execution_vs_verify') {
-    // Executor vs Ground Truth — shows mismatches immediately
-    // OPEN-TRADE-FORWARDER = initial execution
-    // TRADE-MAINTAINER     = ongoing management (SL/TP/DCA)
-    // BYBIT-VERIFICATION-WORKER = what actually happened on Bybit
     lines = lines.filter(l =>
       /\[OPEN-TRADE-FORWARDER\]|\[TRADE-MAINTAINER\]|\[BYBIT-VERIFICATION-WORKER\]/i.test(l)
     );
   }
   // 'all' = no filter
 
-  // THEN cap at MAX_LOG_LINES
   const totalFiltered = lines.length;
+
+  // Cap: use last_n_lines (default 200), hard max MAX_LOG_LINES
+  const cap = Math.min(last_n_lines, MAX_LOG_LINES);
   let truncated = false;
-  if (lines.length > MAX_LOG_LINES) {
-    lines = lines.slice(-MAX_LOG_LINES); // Keep the LAST N lines (most recent)
+  if (lines.length > cap) {
+    lines = lines.slice(-cap);
     truncated = true;
   }
 
   const sanitized = sanitizeOutput(lines.join('\n'));
 
   const header = `Log Summary for ${session_id} (filter: ${filter})\n` +
-    `Total lines after filter: ${totalFiltered}` +
-    (truncated ? ` (showing last ${MAX_LOG_LINES})` : '') +
+    `Total raw lines: ${totalRaw} | After filter: ${totalFiltered}` +
+    (truncated ? ` | Showing last ${cap}` : '') +
     `\nLog file: ${logFile}\n` +
     `---\n`;
 
@@ -907,7 +913,7 @@ export async function e2eObserver(args: unknown): Promise<ServerResult> {
     case 'stop_observation':
       return stopObservation({ session_id: parsed.data.session_id! });
     case 'get_log_summary':
-      return getLogSummary({ session_id: parsed.data.session_id!, filter: parsed.data.filter });
+      return getLogSummary({ session_id: parsed.data.session_id!, filter: parsed.data.filter, last_n_lines: parsed.data.last_n_lines });
     case 'list_sessions':
       return listSessions();
     case 'trigger_test_signal':

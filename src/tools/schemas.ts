@@ -228,8 +228,9 @@ export const E2EObserverArgsSchema = z.object({
   duration_seconds: z.number().optional(),
   // stop_observation / get_log_summary params
   session_id: z.string().optional(),
-  // get_log_summary filter
+  // get_log_summary params
   filter: z.enum(['errors_only', 'trade_flow', 'execution_vs_verify', 'all']).optional(),
+  last_n_lines: z.number().optional(),
   // trigger_test_signal params
   trigger_method: z.enum(['signal_broadcaster', 'direct_post']).optional(),
   signal_payload: z.string().optional(),
