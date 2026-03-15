@@ -32,6 +32,20 @@ import os from 'os';
 import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
 
 /**
+ * Sanitize external metadata to prevent prompt injection via file content.
+ */
+function sanitizeMetadata(value: string): string {
+    return value
+        .replace(/\[SYSTEM INSTRUCTION\]/gi, '[BLOCKED]')
+        .replace(/\[SYSTEM\s+MESSAGE\]/gi, '[BLOCKED]')
+        .replace(/\[SYSTEM\]/gi, '[BLOCKED]')
+        .replace(/\[INST\]/gi, '[BLOCKED]')
+        .replace(/<INSTRUCTION>/gi, '&lt;BLOCKED&gt;')
+        .replace(/<\/INSTRUCTION>/gi, '&lt;/BLOCKED&gt;')
+        .replace(/<!--[\s\S]*?-->/g, '');
+}
+
+/**
  * Expand home directory (~) in a file path
  */
 function expandHome(filePath: string): string {
@@ -110,8 +124,8 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
         // Handle PDF files
         if (fileResult.metadata?.isPdf) {
             const meta = fileResult.metadata;
-            const author = meta?.author ? `, Author: ${meta?.author}` : "";
-            const title = meta?.title ? `, Title: ${meta?.title}` : "";
+            const author = meta?.author ? `, Author: ${sanitizeMetadata(meta.author)}` : "";
+            const title = meta?.title ? `, Title: ${sanitizeMetadata(meta.title)}` : "";
 
             const pdfContent = fileResult.metadata?.pages?.flatMap((p: any) => [
                 ...(p.images?.map((image: any) => ({
@@ -121,7 +135,7 @@ export async function handleReadFile(args: unknown): Promise<ServerResult> {
                 })) ?? []),
                 {
                     type: "text",
-                    text: `<!-- Page: ${p.pageNumber} -->\n${p.text}`,
+                    text: `Page ${p.pageNumber}:\n${sanitizeMetadata(p.text)}`,
                 },
             ]) ?? [];
 

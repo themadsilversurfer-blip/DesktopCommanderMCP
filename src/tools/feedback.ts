@@ -2,11 +2,8 @@ import { ServerResult } from '../types.js';
 import { usageTracker } from '../utils/usageTracker.js';
 import { capture } from '../utils/capture.js';
 import { configManager } from '../config-manager.js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { execFile, spawn } from 'child_process';
 import * as os from 'os';
-
-const execAsync = promisify(exec);
 
 interface FeedbackParams {
   // No user parameters - form will be filled manually
@@ -131,22 +128,24 @@ async function buildTallyUrl(params: FeedbackParams, stats: any): Promise<string
 async function openUrlInBrowser(url: string): Promise<boolean> {
   try {
     const platform = os.platform();
-    
-    let command: string;
-    switch (platform) {
-      case 'darwin':  // macOS
-        command = `open "${url}"`;
-        break;
-      case 'win32':   // Windows
-        command = `start "" "${url}"`;
-        break;
-      default:        // Linux and others
-        command = `xdg-open "${url}"`;
-        break;
-    }
-    
-    await execAsync(command);
-    return true;
+
+    return new Promise((resolve) => {
+      let child;
+      switch (platform) {
+        case 'darwin':
+          child = execFile('open', [url]);
+          break;
+        case 'win32':
+          child = spawn('cmd', ['/c', 'start', '', url], { shell: false });
+          break;
+        default:
+          child = execFile('xdg-open', [url]);
+          break;
+      }
+
+      child.on('error', () => resolve(false));
+      child.on('close', (code) => resolve(code === 0));
+    });
   } catch (error) {
     console.error('Failed to open browser:', error);
     return false;

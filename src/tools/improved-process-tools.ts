@@ -16,6 +16,21 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const mcpRoot = path.resolve(__dirname, '..', '..');
 
+/**
+ * Sanitize process output to prevent prompt injection via terminal output.
+ * Blocks patterns that could be interpreted as AI system instructions.
+ */
+function sanitizeOutput(output: string): string {
+  return output
+    .replace(/\[SYSTEM INSTRUCTION\]/gi, '[BLOCKED]')
+    .replace(/\[SYSTEM\s+MESSAGE\]/gi, '[BLOCKED]')
+    .replace(/\[SYSTEM\]/gi, '[BLOCKED]')
+    .replace(/\[INST\]/gi, '[BLOCKED]')
+    .replace(/<INSTRUCTION>/gi, '&lt;BLOCKED&gt;')
+    .replace(/<\/INSTRUCTION>/gi, '&lt;/BLOCKED&gt;')
+    .replace(/<!--[\s\S]*?-->/g, '');
+}
+
 // Track virtual Node sessions (PIDs that are actually Node fallback sessions)
 const virtualNodeSessions = new Map<number, { timeout_ms: number }>();
 let virtualPidCounter = -1000; // Use negative PIDs for virtual sessions
@@ -63,7 +78,7 @@ async function executeNodeCode(code: string, timeout_ms: number = 30000): Promis
       return {
         content: [{
           type: "text",
-          text: `Execution failed (exit code ${result.exitCode}):\n${result.stderr}\n${result.stdout}`
+          text: `Execution failed (exit code ${result.exitCode}):\n${sanitizeOutput(result.stderr)}\n${sanitizeOutput(result.stdout)}`
         }],
         isError: true
       };
@@ -72,7 +87,7 @@ async function executeNodeCode(code: string, timeout_ms: number = 30000): Promis
     return {
       content: [{
         type: "text",
-        text: result.stdout || '(no output)'
+        text: sanitizeOutput(result.stdout) || '(no output)'
       }]
     };
 
@@ -176,7 +191,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
 
   if (result.pid === -1) {
     return {
-      content: [{ type: "text", text: result.output }],
+      content: [{ type: "text", text: sanitizeOutput(result.output) }],
       isError: true,
     };
   }
@@ -202,7 +217,7 @@ export async function startProcess(args: unknown): Promise<ServerResult> {
   return {
     content: [{
       type: "text",
-      text: `Process started with PID ${result.pid} (shell: ${shellUsed})\nInitial output:\n${result.output}${statusMessage}${timingMessage}`
+      text: `Process started with PID ${result.pid} (shell: ${shellUsed})\nInitial output:\n${sanitizeOutput(result.output)}${statusMessage}${timingMessage}`
     }],
   };
 }
@@ -362,7 +377,7 @@ export async function readProcessOutput(args: unknown): Promise<ServerResult> {
     timingMessage = `\n\n📊 Timing: ${endTime - startTime}ms`;
   }
 
-  const responseText = output || '(No output in requested range)';
+  const responseText = sanitizeOutput(output) || '(No output in requested range)';
 
   return {
     content: [{
@@ -552,8 +567,8 @@ export async function interactWithProcess(args: unknown): Promise<ServerResult> 
     
     await waitForResponse();
 
-    // Clean and format output
-    let cleanOutput = cleanProcessOutput(output, input);
+    // Clean, format, and sanitize output
+    let cleanOutput = sanitizeOutput(cleanProcessOutput(output, input));
     const timeoutReached = !earlyExit && !processState?.isFinished && !processState?.isWaitingForInput;
     
     // Apply output line limit to prevent context overflow

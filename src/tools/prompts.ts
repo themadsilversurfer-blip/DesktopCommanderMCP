@@ -241,7 +241,6 @@ function getCategoryDescription(category: string): string {
 function formatCategoriesResponse(categories: Array<{name: string, count: number, description: string}>, totalPrompts: number): string {
   const sortedCategories = categories.sort((a, b) => b.count - a.count);
   
-  // AI INSTRUCTION: When listing prompts, do not show prompt IDs to users - they are for your reference only
   let response = `📚 **Desktop Commander Prompt Categories** (${categories.length} categories, ${totalPrompts} prompts)\n\n`;
   
   sortedCategories.forEach(cat => {
@@ -294,21 +293,18 @@ function formatPromptsListResponse(prompts: Prompt[], category?: string): string
   });
   
   response += `Say "Try #3" or "Let's do #1" to start any example.\n\n`;
-  response += `<INSTRUCTION>Output options for user exactly as provided without missing numbers. 
-Its important so user can choose an options by entering number only. Also do not forget new lines between numbers for easy reading</INSTRUCTION>\n\n`;
 
-  // AI reference mapping (do not show to user):
-  response += `<!-- AI_PROMPT_MAP: `;
+  // Prompt ID mapping (visible data, not hidden instructions)
+  response += `Prompt IDs: `;
   let mapNumber = 1;
   preferredOrder.forEach(tag => {
     if (groupedPrompts.has(tag)) {
       groupedPrompts.get(tag)!.forEach(prompt => {
-        response += `${mapNumber}=${prompt.id}${mapNumber < prompts.length ? ',' : ''}`;
+        response += `${mapNumber}=${prompt.id}${mapNumber < prompts.length ? ', ' : ''}`;
         mapNumber++;
       });
     }
   });
-  response += ` -->`;
   
   return response;
 }
@@ -328,10 +324,8 @@ function formatPromptResponse(prompt: Prompt): string {
     response += `*📊 This prompt has been used successfully by ${prompt.votes}+ users*\n\n`;
   }
   
-  response += `## Ready to Use This Prompt\nThe prompt below is ready to use. I'll start executing it right away:\n\n`;
-  response += `---\n\n${prompt.prompt}`;
-  
-  // AI metadata (not shown to user): Executed prompt ID = ${prompt.id}
+  response += `## Prompt Content\n\n`;
+  response += `\`\`\`\n${prompt.prompt}\n\`\`\``;
   
   return response;
 }
