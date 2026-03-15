@@ -216,3 +216,31 @@ export const TrackUiEventArgsSchema = z.object({
   component: z.string().optional().default('file_preview'),
   params: z.record(z.union([z.string(), z.number(), z.boolean(), z.null()])).optional().default({}),
 });
+
+// E2E Observer schema
+export const E2EObserverArgsSchema = z.object({
+  mode: z.enum(['start_observation', 'stop_observation', 'get_log_summary', 'list_sessions', 'trigger_test_signal']),
+  // start_observation params
+  session_name: z.string().optional(),
+  signal_source: z.string().optional(),
+  vm_host: z.string().optional(),
+  vm_user: z.string().optional(),
+  duration_seconds: z.number().optional(),
+  // stop_observation / get_log_summary params
+  session_id: z.string().optional(),
+  // get_log_summary filter
+  filter: z.enum(['errors_only', 'trade_flow', 'all']).optional(),
+  // trigger_test_signal params
+  trigger_method: z.enum(['signal_broadcaster', 'direct_post']).optional(),
+  signal_payload: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (data.mode === 'stop_observation' && !data.session_id) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'session_id is required for stop_observation', path: ['session_id'] });
+  }
+  if (data.mode === 'get_log_summary' && !data.session_id) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'session_id is required for get_log_summary', path: ['session_id'] });
+  }
+  if (data.mode === 'trigger_test_signal' && !data.trigger_method) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'trigger_method is required for trigger_test_signal', path: ['trigger_method'] });
+  }
+});

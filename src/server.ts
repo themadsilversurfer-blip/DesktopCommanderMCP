@@ -50,6 +50,7 @@ import {
     GetPromptsArgsSchema,
     GetRecentToolCallsArgsSchema,
     WritePdfArgsSchema,
+    E2EObserverArgsSchema,
 } from './tools/schemas.js';
 import { getConfig, setConfigValue } from './tools/config.js';
 import { getUsageStats } from './tools/usage.js';
@@ -1144,6 +1145,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     title: "Get Prompts",
                     readOnlyHint: true,
                 },
+            },
+            {
+                name: "e2e_observer",
+                description: `E2E Observability tool for the Belovy Trading System. Tails all 11 critical-path components (2 VM processes + 9 CF Workers) into a unified, timestamped log file.
+
+                        MODES:
+                        - start_observation: Start tailing all components. Params: session_name, signal_source, vm_host, vm_user, duration_seconds
+                        - stop_observation: Stop an active session. Params: session_id
+                        - get_log_summary: Read log with optional filter. Params: session_id, filter (errors_only|trade_flow|all)
+                        - list_sessions: List all observation sessions (active and completed)
+                        - trigger_test_signal: Send a test signal to the trading pipeline. Params: trigger_method (signal_broadcaster|direct_post), signal_payload (optional JSON)
+
+                        ${CMD_PREFIX_DESCRIPTION}`,
+                inputSchema: zodToJsonSchema(E2EObserverArgsSchema),
+                annotations: {
+                    title: "E2E Observer",
+                    readOnlyHint: false,
+                    openWorldHint: true,
+                },
             }
         ];
 
@@ -1413,6 +1433,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
             case "edit_block":
                 result = await handlers.handleEditBlock(args);
+                break;
+
+            case "e2e_observer":
+                result = await handlers.handleE2EObserver(args);
                 break;
 
             default:
