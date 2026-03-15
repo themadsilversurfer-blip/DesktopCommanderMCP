@@ -783,13 +783,22 @@ async function triggerTestSignal(args: {
 }): Promise<ServerResult> {
   const { trigger_method, signal_payload } = args;
 
+  // Default payload uses the Baileys WhatsApp bridge format expected by orchestrator.
+  // The orchestrator passes messageData.data to storeInitialMessage() and callAIParser().
+  // AI Parser extracts messageBody from: messageData.data?.body || messageData.message_body
+  // So "data.body" is the critical field — everything else is metadata.
   const defaultPayload = {
-    alarm_signal: true,
-    signal_data: {
-      message_type: 'info_only',
-      message: 'E2E test signal from Desktop Commander Observer',
+    messageId: `e2e-${Date.now()}`,
+    type: 'whatsapp_message',
+    data: {
+      body: 'E2E test signal from Desktop Commander Observer — this is an info-only ping, not a real trade signal.',
+      from_name: 'E2E Observer',
+      from_number: 'e2e-observer',
+      chat_name: 'E2E Test',
+      chat_id: 'e2e-test',
+      whatsapp_id: `e2e-wa-${Date.now()}`,
+      message_type: 'text',
       timestamp: new Date().toISOString(),
-      source: 'e2e_observer',
     },
   };
 
