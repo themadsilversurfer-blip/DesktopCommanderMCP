@@ -219,7 +219,7 @@ export const TrackUiEventArgsSchema = z.object({
 
 // E2E Observer schema
 export const E2EObserverArgsSchema = z.object({
-  mode: z.enum(['start_observation', 'stop_observation', 'get_log_summary', 'list_sessions', 'trigger_test_signal']),
+  mode: z.enum(['preflight_check', 'start_observation', 'stop_observation', 'get_log_summary', 'list_sessions', 'trigger_test_signal']),
   // start_observation params
   session_name: z.string().optional(),
   signal_source: z.string().optional(),

@@ -163,6 +163,200 @@ async function checkSshConnectivity(host: string, user: string): Promise<{ ok: b
   });
 }
 
+// ── Shared: wrangler whoami check ──────────────────────────────────────────
+
+async function checkWranglerAuth(): Promise<{ ok: boolean; account?: string; error?: string }> {
+  return new Promise((resolve) => {
+    execFile('npx', ['wrangler', 'whoami'], { timeout: 15000 }, (error, stdout, stderr) => {
+      const output = (stdout || '') + (stderr || '');
+      if (error || /not authenticated/i.test(output)) {
+        resolve({ ok: false, error: 'Not authenticated' });
+      } else {
+        // Extract account name from whoami output
+        const match = output.match(/Account Name:\s*(.+)/i) || output.match(/👋\s+(.+)/);
+        resolve({ ok: true, account: match ? match[1].trim() : 'authenticated' });
+      }
+    });
+  });
+}
+
+// ── Shared: run SSH command and get output ─────────────────────────────────
+
+async function runSshCommand(host: string, user: string, command: string, timeoutMs: number = 8000): Promise<{ ok: boolean; output: string; error?: string }> {
+  return new Promise((resolve) => {
+    execFile('ssh', [
+      '-o', 'ConnectTimeout=3',
+      '-o', 'BatchMode=yes',
+      '-o', 'StrictHostKeyChecking=no',
+      `${user}@${host}`,
+      command,
+    ], { timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error) {
+        resolve({ ok: false, output: '', error: error.message });
+      } else {
+        resolve({ ok: true, output: (stdout || '') + (stderr || '') });
+      }
+    });
+  });
+}
+
+// ── Mode 0: preflight_check ────────────────────────────────────────────────
+
+async function preflightCheck(args: { vm_host?: string; vm_user?: string }): Promise<ServerResult> {
+  const vmHost = args.vm_host || DEFAULT_VM_HOST;
+  const vmUser = args.vm_user || DEFAULT_VM_USER;
+  const actions: string[] = [];
+
+  interface CheckResult { label: string; status: 'pass' | 'fail' | 'skip'; detail: string }
+  const checks: CheckResult[] = [];
+
+  // CHECK 1 — Wrangler Authentication
+  const wrangler = await checkWranglerAuth();
+  if (wrangler.ok) {
+    checks.push({ label: 'Wrangler Auth', status: 'pass', detail: wrangler.account || 'OK' });
+  } else {
+    checks.push({ label: 'Wrangler Auth', status: 'fail', detail: 'NOT LOGGED IN' });
+    actions.push(
+      `Run: npx wrangler login\n` +
+      `   Opens browser for Cloudflare OAuth.\n` +
+      `   Manual step — cannot be automated.`
+    );
+  }
+
+  // CHECK 2 — SSH Connectivity
+  const ssh = await checkSshConnectivity(vmHost, vmUser);
+  if (ssh.ok) {
+    checks.push({ label: 'SSH VM', status: 'pass', detail: vmHost });
+  } else {
+    checks.push({ label: 'SSH VM', status: 'fail', detail: vmHost });
+    actions.push(
+      `SSH to ${vmUser}@${vmHost} failed.\n` +
+      `   Ensure SSH key exists: ls ~/.ssh/id_rsa\n` +
+      `   Test manually: ssh ${vmUser}@${vmHost} "echo ok"`
+    );
+  }
+
+  // CHECK 3 — PM2 processes on VM
+  if (ssh.ok) {
+    const pm2Result = await runSshCommand(vmHost, vmUser, 'pm2 list --no-color');
+    if (pm2Result.ok) {
+      for (const vmProc of VM_PROCESSES) {
+        const isOnline = pm2Result.output.includes(vmProc.pm2Name) && /online/i.test(pm2Result.output);
+        if (isOnline) {
+          checks.push({ label: vmProc.pm2Name, status: 'pass', detail: 'online' });
+        } else {
+          checks.push({ label: vmProc.pm2Name, status: 'fail', detail: 'NOT RUNNING' });
+          actions.push(`PM2 process down: pm2 restart ${vmProc.pm2Name}`);
+        }
+      }
+    } else {
+      for (const vmProc of VM_PROCESSES) {
+        checks.push({ label: vmProc.pm2Name, status: 'fail', detail: 'pm2 list failed' });
+      }
+      actions.push(`Could not run pm2 list on VM: ${pm2Result.error}`);
+    }
+  } else {
+    for (const vmProc of VM_PROCESSES) {
+      checks.push({ label: vmProc.pm2Name, status: 'skip', detail: 'SSH failed' });
+    }
+  }
+
+  // CHECK 4 — Wrangler can reach workers (quick probe: just try 1 critical worker)
+  if (wrangler.ok) {
+    // Probe orchestrator-worker with a short-lived wrangler tail
+    const probeResult = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+      const proc = spawn('npx', ['wrangler', 'tail', 'orchestrator-worker', '--format', 'json'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let output = '';
+      let settled = false;
+
+      const finish = (ok: boolean, error?: string) => {
+        if (settled) return;
+        settled = true;
+        try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+        resolve({ ok, error });
+      };
+
+      proc.stderr?.on('data', (d) => { output += d.toString(); });
+      proc.stdout?.on('data', () => { finish(true); });
+
+      proc.on('error', (err) => finish(false, err.message));
+      proc.on('close', (code) => {
+        if (!settled) {
+          if (code === 0 || output.includes('Connected')) {
+            finish(true);
+          } else {
+            finish(false, output.substring(0, 200));
+          }
+        }
+      });
+
+      // 5s timeout — if we haven't errored, wrangler is connected and waiting for logs
+      setTimeout(() => finish(true), 5000);
+    });
+
+    if (probeResult.ok) {
+      checks.push({ label: 'CF Workers', status: 'pass', detail: `${CF_WORKERS.length}/${CF_WORKERS.length} reachable` });
+    } else {
+      checks.push({ label: 'CF Workers', status: 'fail', detail: 'connection failed' });
+      actions.push(`Wrangler tail probe failed: ${probeResult.error}\n   Check worker deployments: npx wrangler deployments list`);
+    }
+  } else {
+    checks.push({ label: 'CF Workers', status: 'skip', detail: 'SKIPPED (auth)' });
+  }
+
+  // CHECK 5 — Log directory
+  try {
+    await fsp.mkdir(LOG_DIR, { recursive: true });
+    await fsp.access(LOG_DIR, fs.constants.W_OK);
+    checks.push({ label: 'Log Directory', status: 'pass', detail: 'ready' });
+  } catch (err) {
+    checks.push({ label: 'Log Directory', status: 'fail', detail: 'not writable' });
+    actions.push(`Log directory not writable: ${LOG_DIR}\n   ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // Build report
+  const allPassed = checks.every(c => c.status === 'pass');
+  const W = 46; // box width
+  const line = (s: string) => s + '\n';
+  const pad = (s: string, w: number) => s.length >= w ? s.substring(0, w) : s + ' '.repeat(w - s.length);
+
+  let report = '';
+  report += line(`+${'-'.repeat(W)}+`);
+  report += line(`|${pad('  E2E Observer -- Preflight Check', W)}|`);
+  report += line(`+${'-'.repeat(W)}+`);
+
+  for (const c of checks) {
+    const icon = c.status === 'pass' ? 'OK' : c.status === 'fail' ? 'FAIL' : 'SKIP';
+    const label = pad(c.label, 20);
+    const detail = pad(c.detail, 20);
+    report += line(`| ${pad(icon, 4)} ${label} ${detail} |`);
+  }
+
+  report += line(`+${'-'.repeat(W)}+`);
+
+  if (allPassed) {
+    report += line(`| ${pad('STATUS: READY FOR E2E TESTING', W - 2)} |`);
+  } else {
+    report += line(`| ${pad('STATUS: NOT READY -- Fix issues above', W - 2)} |`);
+  }
+  report += line(`+${'-'.repeat(W)}+`);
+
+  if (actions.length > 0) {
+    report += line(`| ${pad('REQUIRED ACTIONS:', W - 2)} |`);
+    report += line(`+${'-'.repeat(W)}+`);
+    for (let i = 0; i < actions.length; i++) {
+      report += `${i + 1}. ${actions[i]}\n`;
+    }
+  }
+
+  return {
+    content: [{ type: 'text', text: report }],
+    isError: !allPassed,
+  };
+}
+
 // ── Mode 1: start_observation ──────────────────────────────────────────────
 
 async function startObservation(args: {
@@ -239,24 +433,9 @@ async function startObservation(args: {
   }
 
   // Check wrangler authentication before spawning
-  let wranglerAuthenticated = true;
-  try {
-    const wranglerAuth = await new Promise<boolean>((resolve) => {
-      execFile('npx', ['wrangler', 'whoami'], { timeout: 10000 }, (error, stdout, stderr) => {
-        const output = (stdout || '') + (stderr || '');
-        if (error || /not authenticated/i.test(output)) {
-          resolve(false);
-        } else {
-          resolve(true);
-        }
-      });
-    });
-    wranglerAuthenticated = wranglerAuth;
-  } catch {
-    wranglerAuthenticated = false;
-  }
+  const wranglerCheck = await checkWranglerAuth();
 
-  if (!wranglerAuthenticated) {
+  if (!wranglerCheck.ok) {
     writeStream.write(`[${formatTimestamp()}] [OBSERVER] Wrangler auth check FAILED - BLOCKING start\n`);
     writeStream.end();
     return {
@@ -721,6 +900,8 @@ export async function e2eObserver(args: unknown): Promise<ServerResult> {
   const { mode } = parsed.data;
 
   switch (mode) {
+    case 'preflight_check':
+      return preflightCheck(parsed.data);
     case 'start_observation':
       return startObservation(parsed.data);
     case 'stop_observation':
